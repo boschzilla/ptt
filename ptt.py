@@ -5,6 +5,9 @@ Hold a hotkey to record, release to transcribe and paste.
 
 import ctypes
 import io
+import json
+import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -25,26 +28,29 @@ WHISPER_MODELS = {"Fast (base.en)": "base.en", "Accurate (small.en)": "small.en"
 DEFAULT_MODEL_LABEL = "Fast (base.en)"
 MIN_DURATION_SEC = 0.3
 DEFAULT_HOTKEY = "right ctrl"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
 
 user32 = ctypes.windll.user32
 
 
 def find_claude_window():
-    """Find a window with 'Claude' in the title."""
-    result = []
-
-    def enum_cb(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            buf = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(hwnd, buf, 256)
-            title = buf.value
-            if title and "claude" in title.lower():
-                result.append(hwnd)
-        return True
-
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
-    user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-    return result[0] if result else None
+    """Find the window titled exactly 'CLAUDE'."""
+    hwnd = user32.FindWindowW(None, "CLAUDE")
+    return hwnd if hwnd else None
 
 
 def get_foreground_window():
@@ -68,7 +74,7 @@ class PushToTalk:
         self._stop_event = threading.Event()
         self._frames = []
         self._hotkey = DEFAULT_HOTKEY
-        self._hooks = []
+        self._hook = None
 
         # UI options
         self.send_enter = False
@@ -98,13 +104,20 @@ class PushToTalk:
 
     def _register_hotkey(self):
         self._unregister_hotkey()
-        self._hooks.append(keyboard.on_press_key(self._hotkey, self._on_press, suppress=False))
-        self._hooks.append(keyboard.on_release_key(self._hotkey, self._on_release, suppress=False))
+
+        def handler(event):
+            if event.name == self._hotkey:
+                if event.event_type == "down":
+                    self._on_press(event)
+                elif event.event_type == "up":
+                    self._on_release(event)
+
+        self._hook = keyboard.hook(handler, suppress=False)
 
     def _unregister_hotkey(self):
-        for hook in self._hooks:
-            keyboard.unhook(hook)
-        self._hooks.clear()
+        if self._hook:
+            keyboard.unhook(self._hook)
+            self._hook = None
 
     def set_hotkey(self, key: str):
         self._hotkey = key
@@ -217,6 +230,7 @@ class PushToTalk:
 class PttApp:
     def __init__(self):
         self.ptt = PushToTalk()
+        self._cfg = load_config()
         self.root = tk.Tk()
         self.root.title("Push-to-Talk")
         self.root.resizable(False, False)
@@ -224,6 +238,7 @@ class PttApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
+        self._apply_config()
 
         # Thread-safe status updates
         self._pending_status = None
@@ -280,12 +295,48 @@ class PttApp:
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", **pad)
 
+        # Reload button
+        ttk.Button(frame, text="Reload", command=self._reload_app).pack(fill="x", **pad)
+
+        ttk.Separator(frame, orient="horizontal").pack(fill="x", **pad)
+
         # Last transcription
         ttk.Label(frame, text="Last:").pack(anchor="w", padx=8)
         self._last_var = tk.StringVar(value="")
         last_label = ttk.Label(frame, textvariable=self._last_var, wraplength=280,
                                 foreground="gray")
         last_label.pack(anchor="w", padx=8, pady=(0, 8))
+
+    def _apply_config(self):
+        hotkey = self._cfg.get("hotkey", DEFAULT_HOTKEY)
+        model = self._cfg.get("model", DEFAULT_MODEL_LABEL)
+        send_enter = self._cfg.get("send_enter", False)
+        switch_window = self._cfg.get("switch_window", False)
+
+        self._hotkey_var.set(hotkey)
+        self.ptt._hotkey = hotkey
+        self._model_var.set(model)
+        self.ptt._active_model = model
+        self._enter_var.set(send_enter)
+        self.ptt.send_enter = send_enter
+        self._switch_var.set(switch_window)
+        self.ptt.switch_window = switch_window
+
+    def _reload_app(self):
+        """Kill this process and restart it to pick up code changes."""
+        self._save_config()
+        self.ptt.shutdown()
+        self.root.destroy()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    def _save_config(self):
+        self._cfg = {
+            "hotkey": self._hotkey_var.get(),
+            "model": self._model_var.get(),
+            "send_enter": self._enter_var.get(),
+            "switch_window": self._switch_var.get(),
+        }
+        save_config(self._cfg)
 
     def _init_model(self):
         self.ptt.load_models()
@@ -310,29 +361,33 @@ class PttApp:
 
     def _on_model_change(self):
         self.ptt.set_model(self._model_var.get())
+        self._save_config()
 
     def _on_enter_toggle(self):
         self.ptt.send_enter = self._enter_var.get()
+        self._save_config()
 
     def _on_switch_toggle(self):
         self.ptt.switch_window = self._switch_var.get()
+        self._save_config()
 
     def _start_hotkey_capture(self):
         self._hotkey_btn.configure(state="disabled")
         self._hotkey_var.set("Press a key...")
         self.ptt._unregister_hotkey()
 
-        def on_key(event):
-            key = event.name
-            keyboard.unhook(hook)
+        def wait_for_key():
+            time.sleep(0.3)  # ignore the click that triggered this
+            key = keyboard.read_key(suppress=False)
             self.root.after(0, lambda: self._finish_hotkey_capture(key))
 
-        hook = keyboard.on_press(on_key, suppress=False)
+        threading.Thread(target=wait_for_key, daemon=True).start()
 
     def _finish_hotkey_capture(self, key: str):
         self._hotkey_var.set(key)
         self._hotkey_btn.configure(state="normal")
         self.ptt.set_hotkey(key)
+        self._save_config()
 
     def _on_close(self):
         self.ptt.shutdown()
