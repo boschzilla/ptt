@@ -57,11 +57,20 @@ def get_foreground_window():
     return user32.GetForegroundWindow()
 
 
+import subprocess
+
+SW_RESTORE = 9
+
+
 def set_foreground_window(hwnd):
-    """Bring window to foreground with Alt-key trick."""
-    user32.keybd_event(0x12, 0, 0, 0)       # Alt down
-    user32.SetForegroundWindow(hwnd)
-    user32.keybd_event(0x12, 0, 0x0002, 0)  # Alt up
+    """Force window to foreground via PowerShell."""
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    # PowerShell's AppActivate reliably steals focus
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f'(New-Object -ComObject WScript.Shell).AppActivate({hwnd})'],
+        capture_output=True, timeout=3
+    )
 
 
 class PushToTalk:
@@ -187,17 +196,12 @@ class PushToTalk:
         return " ".join(seg.text for seg in segments).strip()
 
     def _deliver(self, text: str):
-        """Paste text, optionally switching windows and sending Enter."""
-        prev_hwnd = None
+        """Paste text into the target window, with or without focus."""
+        WM_PASTE = 0x0302
+        WM_KEYDOWN = 0x0100
+        WM_KEYUP = 0x0101
+        VK_RETURN = 0x0D
 
-        if self.switch_window:
-            prev_hwnd = get_foreground_window()
-            claude_hwnd = find_claude_window()
-            if claude_hwnd:
-                set_foreground_window(claude_hwnd)
-                time.sleep(0.3)
-
-        # Paste via clipboard
         old_clip = ""
         try:
             old_clip = pyperclip.paste()
@@ -205,21 +209,33 @@ class PushToTalk:
             pass
         pyperclip.copy(text)
         time.sleep(0.05)
-        keyboard.send("ctrl+v")
-        time.sleep(0.15)
 
-        if self.send_enter:
-            keyboard.send("enter")
-            time.sleep(0.1)
+        if self.switch_window:
+            claude_hwnd = find_claude_window()
+            if claude_hwnd:
+                # Send paste directly to the Claude window — no focus needed
+                user32.SendMessageW(claude_hwnd, WM_PASTE, 0, 0)
+                if self.send_enter:
+                    time.sleep(0.05)
+                    user32.PostMessageW(claude_hwnd, WM_KEYDOWN, VK_RETURN, 0)
+                    user32.PostMessageW(claude_hwnd, WM_KEYUP, VK_RETURN, 0)
+            else:
+                # Fallback: paste into active window
+                keyboard.send("ctrl+v")
+                time.sleep(0.15)
+                if self.send_enter:
+                    keyboard.send("enter")
+        else:
+            keyboard.send("ctrl+v")
+            time.sleep(0.15)
+            if self.send_enter:
+                keyboard.send("enter")
 
+        time.sleep(0.1)
         try:
             pyperclip.copy(old_clip)
         except Exception:
             pass
-
-        if self.switch_window and prev_hwnd:
-            time.sleep(0.2)
-            set_foreground_window(prev_hwnd)
 
     def shutdown(self):
         self._unregister_hotkey()
