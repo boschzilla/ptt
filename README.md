@@ -41,6 +41,16 @@ Both models load at startup so switching is instant.
 - `pyperclip` — clipboard paste
 - `numpy` — audio processing
 
+## Window-specific paste behavior
+
+PTT detects the target window and uses the appropriate paste shortcut:
+
+- **Cursor / WezTerm** — `Ctrl+Shift+V` (standard `Ctrl+V` is intercepted by Electron/TUI apps like Claude Code)
+- **mintty** — types characters directly (`Ctrl+V` and `Shift+Insert` don't work in mintty)
+- **Everything else** — `Ctrl+V`
+
+Focus is restored using `SystemParametersInfoW` to temporarily disable Windows' foreground lock timeout, avoiding the Alt-key trick which can trigger the Task Switcher.
+
 ## Credits
 
 Inspired by Josh.
